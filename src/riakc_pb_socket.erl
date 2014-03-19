@@ -152,7 +152,13 @@
                                % certificate authentication
                 ssl_opts = [], % Arbitrary SSL options, see the erlang SSL
                                % documentation.
-                reconnect_interval=?FIRST_RECONNECT_INTERVAL :: non_neg_integer()}).
+                reconnect_interval=?FIRST_RECONNECT_INTERVAL :: non_neg_integer(),
+
+                keepalive = false :: boolean(), % if true, client sends an internal ping
+                keepalive_interval = 5 * 60 * 1000 :: pos_integer(), % interval for internal ping
+                keepalive_ref :: reference(),
+                keepalive_req :: reference()
+               }).
 
 %% @private Like `gen_server:call/3', but with the timeout hardcoded
 %% to `infinity'.
@@ -1347,6 +1353,17 @@ handle_info(reconnect, State) ->
             NewState = State#state{failed = orddict:update_counter(Reason, 1, State#state.failed)},
             disconnect(NewState)
     end;
+
+handle_info(keepalive, State)
+  when State#state.active =:= undefined ->
+    ReqId = make_ref(),
+    Request = new_request(rpbpingreq, self(), default_timeout(ping_timeout), {ReqId, self()}),
+    NewState = send_request(Request, State),
+    {noreply, NewState#state{keepalive_req = ReqId}};
+handle_info({ReqId, pong}, State = #state{keepalive_req = ReqId}) ->
+    restart_keepalive_timer(ReqId),
+    State;
+
 handle_info(_, State) ->
     {noreply, State}.
 
@@ -1391,6 +1408,12 @@ parse_options([{tcp_keepalive,Bool}|Options], State) when is_boolean(Bool) ->
     parse_options(Options, State#state{tcp_keepalive = Bool});
 parse_options([tcp_keepalive|Options], State) ->
     parse_options([{tcp_keepalive, true}|Options], State);
+parse_options([{keepalive,Bool}|Options], State) when is_boolean(Bool) ->
+    parse_options(Options, State#state{keepalive = Bool});
+parse_options([keepalive|Options], State) ->
+    parse_options([{keepalive, true}|Options], State);
+parse_options([{keepalive_interval, Interval}|Options], State) when Interval > 0 ->
+    parse_options(Options, State#state{keepalive_interval = Interval});
 parse_options([{credentials, User, Pass}|Options], State) ->
     parse_options(Options, State#state{credentials={User, Pass}});
 parse_options([{certfile, File}|Options], State) ->
@@ -1405,7 +1428,8 @@ parse_options([{ssl_opts, Opts}|Options], State) ->
 maybe_reply({reply, Reply, State}) ->
     Request = State#state.active,
     NewRequest = send_caller(Reply, Request),
-    State#state{active = NewRequest};
+    NewState = #state{active = NewRequest},
+    restart_keepalive_timer(NewState);
 maybe_reply({noreply, State}) ->
     State.
 
@@ -1951,6 +1975,33 @@ restart_req_timer(Request) ->
     end.
 
 %% @private
+%% Start a timer to trigger keepalives.
+create_keepalive_timer(Timeout) ->
+    erlang:send_after(Timeout, self(), keepalive).
+
+%% @private
+%% Cancel keepalive timer.
+cancel_keepalive_timer(undefined) ->
+    ok;
+cancel_keepalive_timer(TRef) ->
+    _ = erlang:cancel_timer(TRef),
+    ok.
+
+%% @private
+%% Restart the timer for keepalives.
+restart_keepalive_timer(State = #state{keepalive_ref = TRef}) ->
+    ok = cancel_keepalive_timer(TRef),
+    maybe_start_keepalive(State).
+
+%% @private
+%% If keepalive is enabled, then start the timer.
+maybe_start_keepalive(State = #state{keepalive = false}) ->
+    State;
+maybe_start_keepalive(State = #state{keepalive_interval = Timeout}) ->
+    NewTref = create_keepalive_timer(Timeout),
+    State#state{keepalive_ref = NewTref}.
+
+%% @private
 %% Connect the socket if disconnected
 connect(State) when State#state.sock =:= undefined ->
     #state{address = Address, port = Port, connects = Connects} = State,
@@ -1961,11 +2012,12 @@ connect(State) when State#state.sock =:= undefined ->
         {ok, Sock} ->
             State1 = State#state{sock = Sock, connects = Connects+1,
                                  reconnect_interval = ?FIRST_RECONNECT_INTERVAL},
-            case State#state.credentials of
+            State2 = maybe_start_keepalive(State1),
+            case State2#state.credentials of
                 undefined ->
-                    {ok, State1};
+                    {ok, State2};
                 _ ->
-                    start_tls(State1)
+                    start_tls(State2)
             end;
         Error ->
             Error
@@ -2076,6 +2128,8 @@ increase_reconnect_interval(State) ->
 send_request(Request0, State) when State#state.active =:= undefined ->
     {Request, Pkt} = encode_request_message(Request0),
     Transport = State#state.transport,
+    %% keepalive not necessary during a request
+    ok = cancel_keepalive_timer(State#state.keepalive_ref),
     case Transport:send(State#state.sock, Pkt) of
         ok ->
             maybe_reply(after_send(Request, State#state{active = Request}));

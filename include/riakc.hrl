@@ -33,7 +33,10 @@
                           auto_reconnect |
                           {auto_reconnect, boolean()} |
                           tcp_keepalive |
-                          {tcp_keepalive, boolean()}.
+                          {tcp_keepalive, boolean()} |
+                          keepalive |
+                          {keepalive, boolean()} |
+                          {keepalive_interval, pos_integer()}.
 %% Options for starting or modifying the connection:
 %% `queue_if_disconnected' when present or true will cause requests to
 %% be queued while the connection is down. `auto_reconnect' when
